@@ -2,6 +2,9 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::vec::IntoIter;
 use alloc::vec::Vec;
 
+use rayon::prelude::*;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
 use cgmath::MetricSpace;
 #[allow(unused_imports)]
 use cgmath::num_traits::Float;
@@ -96,16 +99,12 @@ impl<'a> PolyLine {
     }
 
     pub(crate) fn calc_hash(&self) -> Vec<u8> {
-        let data: Vec<u8> = self.nodes.as_slice().iter()
-            .flat_map(|&p| [p.x.to_be_bytes(), p.y.to_be_bytes()])
-            .flatten()
-            .collect();
-
         let mut hasher = Sha256::new();
-        hasher.update(data.as_slice());
-
-        let hash = hasher.finalize();
-        hash.to_vec()
+        for &p in &self.nodes {
+            hasher.update(p.x.to_be_bytes());
+            hasher.update(p.y.to_be_bytes());
+        }
+        hasher.finalize().to_vec()
     }
 }
 
@@ -127,90 +126,33 @@ impl GenPolyLines {
 
     // Function to calculate the squared centroid distance between two sets of points
     fn sco2(v1: &Cntr, v2: &Cntr) -> f64 {
-        // Initialize squared sum as a floating point number
-        let mut s = 0f64;
-
-        // Iterate through the corresponding pairs of points in both input vectors
-        for (a1, a2) in v1.points.iter().zip(v2.points.iter()) {
-            // Calculate the squared Euclidean distance between current pair of points
-            // and add it to the cumulative squared sum
-            s += (a2.x - a1.x) * (a2.x - a1.x) + (a2.y - a1.y) * (a2.y - a1.y);
-        }
-
-        // Return the mean squared distance by dividing the cumulative squared sum
-        // by the number of points
+        // Compute the mean squared distance using iterator methods
+        let s: f64 = v1.points.iter()
+            .zip(v2.points.iter())
+            .map(|(a1, a2)| a1.distance2(*a2))
+            .sum();
+    
+        // Return the mean squared distance
         s / (v1.points.len() as f64)
     }
 
     pub(crate) fn select_top(counters: &Vec<Vec<Vec2>>, n: usize, grid_size: i16, rect: Rect) -> Vec<(f64, PolyLine)> {
-        let mut top_heap: VecDeque<(f64, PolyLine)> = VecDeque::with_capacity(n);
-        // TODO: select start point from self.cells
-
-        for cntr in counters.iter() {
+        counters.par_iter().flat_map(|cntr| {
             let cn = Cntr::new(Some(cntr.to_vec()), grid_size, &rect);
             let zone = cn.line_zone();
-
+    
             let mut gen_lines = GenPolyLines::new(zone, grid_size);
             let start_point = Point2 { x: 0, y: 0 };
             gen_lines.line_buf.nodes.push(start_point);
-
+    
             let cntr_size = cn.points.len();
             let calc_sco = |pl: &PolyLine|
                 GenPolyLines::sco2(
                     &cn, &pl.line2points(cntr_size, &rect),
                 );
-
-            let mut ff = |pl: &PolyLine| {
-                let d = calc_sco(pl);
-                let len = top_heap.len();
-                if len > 0 {
-                    if d < top_heap.get(len - 1).unwrap().0 || len <= n {
-                        if len == n {
-                            top_heap.pop_front();
-                        }
-                        top_heap.push_back((d, pl.clone()));
-                        top_heap.make_contiguous().sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-                    }
-                } else {
-                    top_heap.push_back((d, pl.clone()));
-                }
-            };
-            gen_lines.complete_line(&mut ff);
-        }
-        let v = top_heap.iter().cloned().collect();
-        v
-    }
-
-    // This function selects the top n ranked PolyLines for each contour in a given grid.
-    // The ranking is based on the score calculated by the `GenPolyLines::sco2` method.
-    pub(crate) fn select_top_all(counters: &Vec<Vec<Vec2>>, n: usize, grid_size: usize, rect: Rect) -> Vec<Vec<(f64, Vec<u8>)>> {
-        // Initialize a 2D Vector to store the top n PolyLines for each contour.
-        let mut top_heap: Vec<Vec<(f64, Vec<u8>)>> = Vec::with_capacity(grid_size as usize);
-
-        // Iterate through each contour.
-        for cntr in counters.iter() {
-            // Create a Deque to store the top n PolyLines within the current contour.
+    
             let mut top_in_cntr: VecDeque<(f64, PolyLine)> = VecDeque::with_capacity(n);
-
-            // Create Cntr and Zone objects needed for the calculations.
-            let cn = Cntr::new(Some(cntr.to_vec()), grid_size as i16, &rect);
-            let zone = cn.line_zone();
-
-            // Initialize a new GenPolyLines object with the given zone.
-            let mut gen_lines = GenPolyLines::new(zone, grid_size as i16);
-            let start_point = Point2 { x: 0, y: 0 };
-            gen_lines.line_buf.nodes.push(start_point);
-
-            // Calculate the size of the current contour.
-            let cntr_size = cn.points.len();
-
-            // Closure to calculate the score for a given PolyLine using `GenPolyLines::sco2`.
-            let calc_sco = |pl: &PolyLine|
-                GenPolyLines::sco2(
-                    &cn, &pl.line2points(cntr_size, &rect),
-                );
-
-            // Closure to update the top n PolyLines deque for the current contour.
+    
             let mut ff = |pl: &PolyLine| {
                 let d = calc_sco(pl);
                 let len = top_in_cntr.len();
@@ -226,38 +168,71 @@ impl GenPolyLines {
                     top_in_cntr.push_back((d, pl.clone()));
                 }
             };
-
-            // Generate and rank PolyLines for the current contour using the `ff` closure.
             gen_lines.complete_line(&mut ff);
-
-            // Add the ranked PolyLines for the current contour to the 2D Vector.
-            // Use calc_hash() to map the PolyLine to a Vec<u8> for storage.
-            top_heap.push(top_in_cntr.into_iter().map(|a| (a.0, a.1.calc_hash().to_vec())).collect());
-        }
-        top_heap
+            
+            top_in_cntr.into_iter().collect::<Vec<_>>().into_par_iter()
+        }).collect()
     }
+    
+    
+
+    // This function selects the top n ranked PolyLines for each contour in a given grid.
+    // The ranking is based on the score calculated by the `GenPolyLines::sco2` method.
+    pub(crate) fn select_top_all(lines: &Vec<Vec<Vec2>>, depth: usize, grid_size: usize, rect: Rect) -> Vec<Vec<(f64, Vec<u8>)>> {
+        lines.par_iter().map(|l| {
+            let mut top_in_line: Vec<(f64, PolyLine)> = Vec::with_capacity(depth);
+            let cn = Cntr::new(Some(l.to_vec()), grid_size as i16, &rect);
+            let zone = cn.line_zone();
+            let mut gen_lines = GenPolyLines::new(zone, grid_size as i16);
+            let start_point = Point2 { x: 0, y: 0 };
+            gen_lines.line_buf.nodes.push(start_point);
+            let line_size = cn.points.len();
+            let calc_sco = |pl: &PolyLine|
+                GenPolyLines::sco2(&cn, &pl.line2points(line_size, &rect));
+            let mut ff = |pl: &PolyLine| {
+                let d = calc_sco(pl);
+                if let Some(_) = top_in_line.iter().find(|a| a.0 == d) {
+                    return;
+                } else {
+                    if top_in_line.len() == depth {
+                        let m = top_in_line.iter()
+                            .enumerate()
+                            .max_by(|(_, a), (_, b)|
+                                a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal)
+                            )
+                            .map(|(index, _)| index);
+                        if let Some(i) = m {
+                            top_in_line[i] = (d, pl.clone());
+                        }
+                    } else {
+                        top_in_line.push((d, pl.clone()));
+                    }
+                }
+            };
+            gen_lines.complete_line(&mut ff);
+            top_in_line.into_iter().collect::<Vec<_>>().into_par_iter().map(|a| (a.0, a.1.calc_hash().to_vec())).collect()
+        }).collect()
+    }
+    
+    
 
     pub(crate) fn select_top_all_3(counters: &Vec<Vec<Vec2>>, depth: usize, grid_size: usize, rect: Rect) -> Vec<Vec<(f64, Vec<u8>)>> {
-        let mut top_heap: Vec<Vec<(f64, Vec<u8>)>> = Vec::with_capacity(grid_size as usize);
-
-        for cntr in counters.iter() {
+        counters.par_iter().map(|cntr| {
             let mut top_in_cntr: Vec<(f64, PolyLine)> = Vec::with_capacity(depth);
             let cn = Cntr::new(Some(cntr.to_vec()), grid_size as i16, &rect);
             let zone = cn.line_zone();
             let mut gen_lines = GenPolyLines::new(zone, grid_size as i16);
             let start_point = Point2 { x: 0, y: 0 };
-
+    
             gen_lines.line_buf.nodes.push(start_point);
-
+    
             let cntr_size = cn.points.len();
             let calc_sco = |pl: &PolyLine|
-                GenPolyLines::sco2(
-                    &cn, &pl.line2points(cntr_size, &rect),
-                );
-
+                GenPolyLines::sco2(&cn, &pl.line2points(cntr_size, &rect));
+    
             let mut ff = |pl: &PolyLine| {
                 let d = calc_sco(pl);
-
+    
                 if let Some(_) = top_in_cntr.iter().find(|a| a.0 == d) {
                     return;
                 } else {
@@ -268,7 +243,7 @@ impl GenPolyLines {
                                 a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal)
                             )
                             .map(|(index, _)| index);
-
+    
                         if let Some(i) = m {
                             top_in_cntr[i] = (d, pl.clone());
                         }
@@ -278,40 +253,81 @@ impl GenPolyLines {
                 }
             };
             gen_lines.complete_line(&mut ff);
-            top_heap.push(top_in_cntr.into_iter().map(|a| (a.0, a.1.calc_hash().to_vec())).collect());
-        }
-        top_heap
+            top_in_cntr.into_par_iter().map(|a| (a.0, a.1.calc_hash().to_vec())).collect()
+        }).collect()
     }
+
+    pub(crate) fn select_top_all_4(
+        cntrs: &Vec<Vec<Vec2>>, depth: usize, grid_size: usize, rect: Rect,
+    ) -> Vec<Vec<(f64, Vec<u8>)>> {
+        
+        cntrs.par_iter().map(|cntr| {
+            let mut top_in_cntr: Vec<(f64, PolyLine)> = Vec::with_capacity(depth);
+            let cn = Cntr::new(Some(cntr.to_vec()), grid_size as i16, &rect);
+            let zone = cn.line_zone();
+            let mut gen_lines = GenPolyLines::new(zone, grid_size as i16);
+            let start_point = Point2 { x: 0, y: 0 };
+    
+            gen_lines.line_buf.nodes.push(start_point);
+    
+            let cntr_size = cn.points.len();
+            let calc_sco = |pl: &PolyLine|
+                GenPolyLines::sco2(
+                    &cn, &pl.line2points(cntr_size, &rect),
+                );
+    
+            let mut ff = |pl: &PolyLine| {
+                let d = calc_sco(pl);
+    
+                if let Some(_) = top_in_cntr.iter().find(|a| a.0 == d) {
+                    return
+                } else {
+                    if top_in_cntr.len() == depth {
+                        let m = top_in_cntr.iter()
+                            .enumerate()
+                            .max_by(|(_, a), (_, b)|
+                                a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal)
+                            );
+    
+                        if let Some((i, r)) = m {
+                            if r.0 > d {
+                                top_in_cntr[i] = (d, pl.clone());
+                            }
+                        }
+                    } else {
+                        top_in_cntr.push((d, pl.clone()));
+                    }
+                }
+            };
+            gen_lines.complete_line(&mut ff);
+            top_in_cntr.into_iter().collect::<Vec<_>>().into_par_iter().map(|a| (a.0, a.1.calc_hash().to_vec())).collect()
+        }).collect()
+    }
+    
+    
 
     // This function recursively explores and completes a polyline
     // using the provided closure or function `F` to process each completed polyline.
     fn complete_line<F>(&mut self, f: &mut F) where F: FnMut(&PolyLine) {
-        // Increment the recursion level counter
         self.lev += 1;
-
-        // Store the last point in the polyline as the starting point
         let start_point = self.line_buf.nodes.last().unwrap().clone();
-        // Store the first point in the polyline
         let first_point = self.line_buf.nodes.first().unwrap().clone();
-        // Find neighboring nodes that can be connected to the starting point
         let neighbour_nodes = NeighbourNodes::new(&self.cells, &self.line_buf, start_point, self.line_buf.grid_size);
 
-        // Iterate over neighbor nodes
         for p in neighbour_nodes.into_iter() {
-            // If the current neighbor node is the first point, complete the polyline
             if p == first_point {
-                self.line_buf.nodes.push(p);
-                (*f)(&self.line_buf); // Process the completed polyline with the closure or function `F`
-                self.line_buf.nodes.pop();
+                if self.line_buf.nodes.len() > 5 {
+                    self.line_buf.nodes.push(p);
+                    (*f)(&self.line_buf); 
+                    self.line_buf.nodes.pop();
+                }
                 continue;
             }
 
-            // Add the current neighbor node to the polyline and then recursively call `complete_line` to explore further.
             self.line_buf.nodes.push(p);
             self.complete_line(f);
-            self.line_buf.nodes.pop(); // Remove the added node after exploration is done
+            self.line_buf.nodes.pop();
         }
-        // Decrement the recursion level counter
         self.lev -= 1;
     }
 }
@@ -334,23 +350,22 @@ impl NeighbourNodes {
 
     fn near_points(z: &CellSet, line: &PolyLine, start_point: Point2<i32>, dist: i32, grid_size: i16) -> Vec<Point2<i32>> {
         let grid_size_i32 = grid_size as i32;
+
         let chk_zone = |i: i32, j: i32, z: &CellSet, line: &PolyLine| -> bool {
             if i < 0 || i >= grid_size_i32 || j < 0 || j >= grid_size_i32 {
                 return false;
             }
-
-            let first = line.nodes.first().unwrap().clone();
-            if first == (Point2 { x: i, y: j }) && line.nodes.len() > 5 {
-                return true;
-            }
-            if !z.contains(&(i, j)) {
-                return false;
-            }
-
             for Point2 { x: pi, y: pj } in line.nodes.iter() {
                 if (pi - i).abs() < dist as i32 && (pj - j).abs() < dist as i32 {
                     return false;
                 }
+            }
+            if !z.contains(&(i, j)) {
+                return false;
+            }
+            let first = line.nodes.first().unwrap().clone();
+            if first == (Point2 { x: i, y: j }) && line.nodes.len() > 5 {
+                return true;
             }
             true
         };
@@ -363,37 +378,26 @@ impl NeighbourNodes {
         let max_i = i0 + dist;
         let max_j = j0 + dist - 1;
 
-        for i in min_i..=max_i {
-            let j = min_j - 1;
-            if chk_zone(i, j, z, line) {
-                v.push(Point2::new(i, j));
+        for i in [min_i, max_i].iter() {
+            for j in min_j..=max_j {
+                if chk_zone(*i, j, z, line) {
+                    v.push(Point2::new(*i, j));
+                }
             }
         }
 
-        for j in min_j..=max_j {
-            let i = max_i;
-            if chk_zone(i, j, z, line) {
-                v.push(Point2::new(i, j));
+        for j in [min_j - 1, max_j + 1].iter() {
+            for i in min_i..=max_i {
+                if chk_zone(i, *j, z, line) {
+                    v.push(Point2::new(i, *j));
+                }
             }
         }
 
-        for i in min_i..=max_i {
-            let j = max_j + 1;
-            if chk_zone(i, j, z, line) {
-                v.push(Point2::new(i, j));
-            }
-        }
-
-        for j in min_j..=max_j {
-            let i = min_i;
-            if chk_zone(i, j, z, line) {
-                v.push(Point2::new(i, j));
-            }
-        }
-
-        v.clone()
+        v
     }
 }
+
 
 impl IntoIterator for NeighbourNodes {
     type Item = Point2<i32>;
